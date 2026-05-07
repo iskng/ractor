@@ -35,7 +35,10 @@ impl Actor for DummyNodeServer {
         message: Self::Msg,
         _state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        if let crate::node::NodeServerMessage::CheckSession { reply, peer_name } = message {
+        if let crate::node::NodeServerMessage::CheckSession {
+            reply, peer_name, ..
+        } = message
+        {
             match peer_name.name.as_str() {
                 "other_continues" => {
                     let _ = reply.send(crate::node::SessionCheckReply::OtherConnectionContinues);

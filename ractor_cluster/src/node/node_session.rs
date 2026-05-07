@@ -253,6 +253,34 @@ impl NodeSession {
                 state.auth = AuthenticationState::AsClient(next);
             }
             AuthenticationState::AsServer(server_auth) => {
+                if let (
+                    auth::ServerAuthenticationProcess::WaitingOnClientStatus,
+                    Some(auth_protocol::authentication_message::Msg::ClientStatus(status)),
+                ) = (server_auth, message.msg.as_ref())
+                {
+                    let alive_decision = self
+                        .node_server
+                        .call(
+                            |tx| super::NodeServerMessage::HandleAliveDecision {
+                                actor_id: myself.get_id(),
+                                continue_session: status.status,
+                                reply: tx,
+                            },
+                            Some(Duration::from_millis(500)),
+                        )
+                        .await;
+                    if !matches!(alive_decision, Ok(CallResult::Success(()))) {
+                        tracing::warn!(
+                            "NodeSession {} failed to resolve ALIVE decision with NodeServer",
+                            self.node_id
+                        );
+                        state.auth =
+                            AuthenticationState::AsServer(auth::ServerAuthenticationProcess::Close);
+                        myself.stop(Some("auth_fail".to_string()));
+                        return;
+                    }
+                }
+
                 let mut next = server_auth.next(message, &self.cookie);
 
                 match &next {
@@ -264,6 +292,7 @@ impl NodeSession {
                             .node_server
                             .call(
                                 |tx| super::NodeServerMessage::CheckSession {
+                                    actor_id: myself.get_id(),
                                     peer_name: peer_name.clone(),
                                     reply: tx,
                                 },

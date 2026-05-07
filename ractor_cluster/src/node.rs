@@ -49,6 +49,7 @@ pub mod node_session;
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 pub use node_session::NodeSession;
@@ -130,10 +131,25 @@ pub enum NodeServerMessage {
     /// i.e. if A is connected to B and A.name > B.name, but then B connects to A, B's request to connect
     /// to A should be rejected
     CheckSession {
+        /// The [NodeSession] actor id requesting the check
+        actor_id: ActorId,
         /// The peer's name to investigate
         peer_name: auth_protocol::NameMessage,
         /// Reply channel for RPC
         reply: RpcReplyPort<SessionCheckReply>,
+    },
+
+    /// Resolve a pending `ALIVE` duplicate decision for the given session.
+    ///
+    /// If `continue_session` is true, an older duplicate session (if tracked) is terminated
+    /// so this session can continue handshaking.
+    HandleAliveDecision {
+        /// The [NodeSession] actor id which received `ALIVE`
+        actor_id: ActorId,
+        /// Client decision (`true` => continue with this session, `false` => close it)
+        continue_session: bool,
+        /// Reply channel for RPC completion
+        reply: RpcReplyPort<()>,
     },
 
     /// A request to update the session mapping with this now known node's name
@@ -328,40 +344,104 @@ pub trait NodeEventSubscription: Send + 'static {
 pub struct NodeServerState {
     listener: ActorRef<crate::net::ListenerMessage>,
     node_sessions: HashMap<ActorId, NodeServerSessionInformation>,
+    authenticated_sessions: HashSet<ActorId>,
+    ready_sessions: HashSet<ActorId>,
+    pending_alive_replacements: HashMap<ActorId, ActorId>,
     node_id_counter: NodeId,
     this_node_name: auth_protocol::NameMessage,
     subscriptions: HashMap<String, Box<dyn NodeEventSubscription>>,
 }
 
 impl NodeServerState {
-    fn check_peers(&self, new_peer: auth_protocol::NameMessage) -> SessionCheckReply {
+    fn session_is_live(&self, actor_id: ActorId) -> bool {
+        self.authenticated_sessions.contains(&actor_id) || self.ready_sessions.contains(&actor_id)
+    }
+
+    fn apply_alive_decision(&mut self, actor_id: ActorId, continue_session: bool) {
+        if let Some(existing_actor_id) = self.pending_alive_replacements.remove(&actor_id) {
+            if continue_session {
+                if let Some(existing) = self.node_sessions.get(&existing_actor_id) {
+                    existing
+                        .actor
+                        .stop(Some("duplicate_connection_replaced".to_string()));
+                }
+            }
+        }
+    }
+
+    fn clear_actor_tracking(&mut self, actor_id: ActorId) {
+        let _ = self.authenticated_sessions.remove(&actor_id);
+        let _ = self.ready_sessions.remove(&actor_id);
+        self.pending_alive_replacements
+            .retain(|candidate, existing| *candidate != actor_id && *existing != actor_id);
+    }
+
+    fn check_peers(
+        &mut self,
+        actor_id: ActorId,
+        new_peer: auth_protocol::NameMessage,
+    ) -> SessionCheckReply {
+        let mut live_existing: Option<ActorId> = None;
+        let mut outgoing_existing: Option<ActorId> = None;
+        let mut incoming_existing: Option<ActorId> = None;
+
         for (_key, value) in self.node_sessions.iter() {
+            if value.actor.get_id() == actor_id {
+                continue;
+            }
             if let Some(existing_peer) = &value.peer_name {
                 if existing_peer.name == new_peer.name {
-                    match (
-                        existing_peer.name.cmp(&self.this_node_name.name),
-                        value.is_server,
-                    ) {
-                        // the peer's name is > this node's name and they connected to us
-                        // or
-                        // the peer's name is < this node's name and we connected to them
-                        (Ordering::Greater, true) | (Ordering::Less, false) => {
-                            value.actor.stop(Some("duplicate_connection".to_string()));
-                            return SessionCheckReply::OtherConnectionContinues;
+                    if self.session_is_live(value.actor.get_id()) {
+                        if live_existing.is_none() {
+                            live_existing = Some(value.actor.get_id());
                         }
-                        (Ordering::Greater, false) | (Ordering::Less, true) => {
-                            // the inverse of the first two conditions, terminate the other
-                            // connection and let this one continue
-                            return SessionCheckReply::ThisConnectionContinues;
+                    } else if value.is_server {
+                        if incoming_existing.is_none() {
+                            incoming_existing = Some(value.actor.get_id());
                         }
-                        _ => {
-                            // something funky is going on...
-                            return SessionCheckReply::DuplicateConnection;
-                        }
+                    } else if outgoing_existing.is_none() {
+                        outgoing_existing = Some(value.actor.get_id());
                     }
                 }
             }
         }
+
+        // There is already a live/authenticated session with this peer. Follow the
+        // Erlang `ALIVE` path and let the client decide whether to replace it.
+        if let Some(existing_actor_id) = live_existing {
+            self.pending_alive_replacements
+                .insert(actor_id, existing_actor_id);
+            return SessionCheckReply::DuplicateConnection;
+        }
+
+        // Simultaneous connect arbitration only applies when an existing session is an
+        // outgoing attempt from this node.
+        if let Some(existing_actor_id) = outgoing_existing {
+            match new_peer.name.cmp(&self.this_node_name.name) {
+                // Peer name is larger, so incoming attempt should win.
+                Ordering::Greater => {
+                    if let Some(existing) = self.node_sessions.get(&existing_actor_id) {
+                        existing
+                            .actor
+                            .stop(Some("duplicate_connection".to_string()));
+                    }
+                    return SessionCheckReply::ThisConnectionContinues;
+                }
+                // Our name is larger, keep our outgoing attempt and reject incoming.
+                Ordering::Less => {
+                    return SessionCheckReply::OtherConnectionContinues;
+                }
+                Ordering::Equal => {
+                    return SessionCheckReply::DuplicateConnection;
+                }
+            }
+        }
+
+        // Existing incoming handshake with same peer: keep existing and reject new.
+        if incoming_existing.is_some() {
+            return SessionCheckReply::OtherConnectionContinues;
+        }
+
         SessionCheckReply::NoOtherConnection
     }
 }
@@ -388,6 +468,9 @@ impl Actor for NodeServer {
 
         Ok(Self::State {
             node_sessions: HashMap::new(),
+            authenticated_sessions: HashSet::new(),
+            ready_sessions: HashSet::new(),
+            pending_alive_replacements: HashMap::new(),
             listener: actor_ref,
             node_id_counter: 0,
             this_node_name: auth_protocol::NameMessage {
@@ -493,6 +576,7 @@ impl Actor for NodeServer {
                 }
             }
             Self::Msg::ConnectionAuthenticated(actor_id) => {
+                let _ = state.authenticated_sessions.insert(actor_id);
                 if let Some(entry) = state.node_sessions.get(&actor_id) {
                     for (_, sub) in state.subscriptions.iter() {
                         sub.node_session_authenicated(entry.clone());
@@ -500,6 +584,7 @@ impl Actor for NodeServer {
                 }
             }
             Self::Msg::ConnectionReady(actor_id) => {
+                let _ = state.ready_sessions.insert(actor_id);
                 if let Some(entry) = state.node_sessions.get(&actor_id) {
                     for (_, sub) in state.subscriptions.iter() {
                         sub.node_session_ready(entry.clone());
@@ -511,8 +596,20 @@ impl Actor for NodeServer {
                     entry.update(name);
                 }
             }
-            Self::Msg::CheckSession { peer_name, reply } => {
-                let _ = reply.send(state.check_peers(peer_name));
+            Self::Msg::CheckSession {
+                actor_id,
+                peer_name,
+                reply,
+            } => {
+                let _ = reply.send(state.check_peers(actor_id, peer_name));
+            }
+            Self::Msg::HandleAliveDecision {
+                actor_id,
+                continue_session,
+                reply,
+            } => {
+                state.apply_alive_decision(actor_id, continue_session);
+                let _ = reply.send(());
             }
             Self::Msg::GetSessions(reply) => {
                 let mut map = HashMap::new();
@@ -561,6 +658,7 @@ impl Actor for NodeServer {
                             .await?;
                     state.listener = actor_ref;
                 } else {
+                    state.clear_actor_tracking(actor.get_id());
                     match state.node_sessions.entry(actor.get_id()) {
                         Entry::Occupied(o) => {
                             tracing::warn!(
@@ -601,6 +699,7 @@ impl Actor for NodeServer {
                             .await?;
                     state.listener = actor_ref;
                 } else {
+                    state.clear_actor_tracking(actor.get_id());
                     match state.node_sessions.entry(actor.get_id()) {
                         Entry::Occupied(o) => {
                             tracing::warn!(
@@ -634,7 +733,10 @@ impl Actor for NodeServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ractor::Actor;
+    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
 
     #[test]
     fn test_node_server_creation() {
@@ -751,5 +853,215 @@ mod tests {
         assert_eq!(node.listen_addr, Some(ipv4_addr));
         assert_eq!(node.port, 9090);
         assert_eq!(node.node_name, "test_node");
+    }
+
+    struct DummyListener;
+
+    #[cfg_attr(feature = "async-trait", ractor::async_trait)]
+    impl Actor for DummyListener {
+        type Msg = crate::net::ListenerMessage;
+        type State = ();
+        type Arguments = ();
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            _args: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(())
+        }
+    }
+
+    struct SessionTerminationProbe;
+
+    #[cfg_attr(feature = "async-trait", ractor::async_trait)]
+    impl Actor for SessionTerminationProbe {
+        type Msg = NodeSessionMessage;
+        type State = Option<tokio::sync::oneshot::Sender<()>>;
+        type Arguments = tokio::sync::oneshot::Sender<()>;
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            stop_notify: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(Some(stop_notify))
+        }
+
+        async fn post_stop(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            if let Some(tx) = state.take() {
+                let _ = tx.send(());
+            }
+            Ok(())
+        }
+    }
+
+    fn make_name(name: &str) -> auth_protocol::NameMessage {
+        auth_protocol::NameMessage {
+            flags: Some(auth_protocol::NodeFlags {
+                version: PROTOCOL_VERSION,
+            }),
+            name: name.to_string(),
+            connection_string: format!("{name}:12345"),
+        }
+    }
+
+    fn build_state(
+        listener: ActorRef<crate::net::ListenerMessage>,
+        this_node_name: auth_protocol::NameMessage,
+        node_sessions: HashMap<ActorId, NodeServerSessionInformation>,
+    ) -> NodeServerState {
+        NodeServerState {
+            listener,
+            node_sessions,
+            authenticated_sessions: HashSet::new(),
+            ready_sessions: HashSet::new(),
+            pending_alive_replacements: HashMap::new(),
+            node_id_counter: 8,
+            this_node_name,
+            subscriptions: HashMap::new(),
+        }
+    }
+
+    #[ractor::concurrency::test]
+    async fn check_peers_other_connection_continues_should_not_stop_existing_session() {
+        let (listener, listener_handle) = Actor::spawn(None, DummyListener, ())
+            .await
+            .expect("failed to start dummy listener");
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let (existing_actor, existing_handle) =
+            Actor::spawn(None, SessionTerminationProbe, stop_tx)
+                .await
+                .expect("failed to start session termination probe");
+
+        let this_node_name = make_name("node_a@localhost");
+        let peer_name = make_name("node_z@localhost");
+
+        let mut existing =
+            NodeServerSessionInformation::new(existing_actor.clone(), true, 7, "peer".to_string());
+        existing.update(peer_name.clone());
+
+        let mut node_sessions = HashMap::new();
+        node_sessions.insert(existing_actor.get_id(), existing);
+
+        let mut state = build_state(listener.clone(), this_node_name, node_sessions);
+
+        let outcome = state.check_peers(ActorId::Local(42), peer_name);
+        assert!(matches!(
+            outcome,
+            SessionCheckReply::OtherConnectionContinues
+        ));
+
+        let terminated = tokio::time::timeout(Duration::from_millis(300), stop_rx).await;
+        assert!(
+            terminated.is_err(),
+            "existing session terminated despite `OtherConnectionContinues` outcome"
+        );
+
+        existing_actor.stop(None);
+        listener.stop(None);
+        let _ = existing_handle.await;
+        let _ = listener_handle.await;
+    }
+
+    #[ractor::concurrency::test]
+    async fn check_peers_this_connection_continues_should_stop_existing_outgoing_session() {
+        let (listener, listener_handle) = Actor::spawn(None, DummyListener, ())
+            .await
+            .expect("failed to start dummy listener");
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let (existing_actor, existing_handle) =
+            Actor::spawn(None, SessionTerminationProbe, stop_tx)
+                .await
+                .expect("failed to start session termination probe");
+
+        let this_node_name = make_name("node_a@localhost");
+        let peer_name = make_name("node_z@localhost");
+
+        let mut existing =
+            NodeServerSessionInformation::new(existing_actor.clone(), false, 7, "peer".to_string());
+        existing.update(peer_name.clone());
+
+        let mut node_sessions = HashMap::new();
+        node_sessions.insert(existing_actor.get_id(), existing);
+
+        let mut state = build_state(listener.clone(), this_node_name, node_sessions);
+
+        let outcome = state.check_peers(ActorId::Local(43), peer_name);
+        assert!(matches!(
+            outcome,
+            SessionCheckReply::ThisConnectionContinues
+        ));
+
+        let terminated = tokio::time::timeout(Duration::from_millis(300), stop_rx).await;
+        if terminated.is_err() {
+            existing_actor.stop(None);
+        }
+        assert!(
+            terminated.is_ok(),
+            "existing outgoing session was not terminated for `ThisConnectionContinues`"
+        );
+
+        listener.stop(None);
+        let _ = existing_handle.await;
+        let _ = listener_handle.await;
+    }
+
+    #[ractor::concurrency::test]
+    async fn check_peers_alive_path_replaces_existing_only_when_client_confirms() {
+        let (listener, listener_handle) = Actor::spawn(None, DummyListener, ())
+            .await
+            .expect("failed to start dummy listener");
+
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let (existing_actor, existing_handle) =
+            Actor::spawn(None, SessionTerminationProbe, stop_tx)
+                .await
+                .expect("failed to start session termination probe");
+
+        let this_node_name = make_name("node_a@localhost");
+        let peer_name = make_name("node_b@localhost");
+
+        let mut existing =
+            NodeServerSessionInformation::new(existing_actor.clone(), true, 7, "peer".to_string());
+        existing.update(peer_name.clone());
+
+        let mut node_sessions = HashMap::new();
+        node_sessions.insert(existing_actor.get_id(), existing);
+
+        let mut state = build_state(listener.clone(), this_node_name, node_sessions);
+        let _ = state.authenticated_sessions.insert(existing_actor.get_id());
+
+        let first = state.check_peers(ActorId::Local(44), peer_name.clone());
+        assert!(matches!(first, SessionCheckReply::DuplicateConnection));
+
+        // Client says "false", so existing should remain and no termination should happen.
+        state.apply_alive_decision(ActorId::Local(44), false);
+        let not_terminated = tokio::time::timeout(Duration::from_millis(150), &mut stop_rx).await;
+        assert!(not_terminated.is_err());
+
+        // Re-register a pending ALIVE replacement and then accept replacement.
+        let second = state.check_peers(ActorId::Local(45), peer_name);
+        assert!(matches!(second, SessionCheckReply::DuplicateConnection));
+        state.apply_alive_decision(ActorId::Local(45), true);
+
+        let terminated = tokio::time::timeout(Duration::from_millis(300), &mut stop_rx).await;
+        if terminated.is_err() {
+            existing_actor.stop(None);
+        }
+        assert!(
+            terminated.is_ok(),
+            "existing session was not terminated after ALIVE client confirmation"
+        );
+
+        listener.stop(None);
+        let _ = existing_handle.await;
+        let _ = listener_handle.await;
     }
 }
