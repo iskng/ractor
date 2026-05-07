@@ -370,6 +370,15 @@ struct SessionReaderState {
     reader: Option<ActorReadHalf>,
 }
 
+fn close_reader(
+    myself: &ActorRef<SessionReaderMessage>,
+    state: &mut SessionReaderState,
+    reason: impl Into<String>,
+) {
+    drop(state.reader.take());
+    myself.stop(Some(reason.into()));
+}
+
 #[cfg_attr(feature = "async-trait", ractor::async_trait)]
 impl Actor for SessionReader {
     type Msg = SessionReaderMessage;
@@ -415,13 +424,15 @@ impl Actor for SessionReader {
                         }
                         Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
                             tracing::trace!("Error (EOF) on stream");
-                            // EOF, close the stream by dropping the stream
-                            drop(state.reader.take());
-                            myself.stop(Some("channel_closed".to_string()));
+                            close_reader(&myself, state, "channel_closed");
+                            return Ok(());
                         }
-                        Err(_other_err) => {
-                            tracing::trace!("Error ({_other_err:?}) on stream");
-                            // some other TCP error, more handling necessary
+                        Err(other_err) => {
+                            tracing::warn!(
+                                "Error ({other_err:?}) on stream; closing session reader"
+                            );
+                            close_reader(&myself, state, "channel_closed");
+                            return Ok(());
                         }
                     }
                 }
@@ -452,13 +463,16 @@ impl Actor for SessionReader {
                             }
                         }
                         Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
-                            // EOF, close the stream by dropping the stream
-                            drop(state.reader.take());
-                            myself.stop(Some("channel_closed".to_string()));
+                            tracing::trace!("Error (EOF) on stream");
+                            close_reader(&myself, state, "channel_closed");
                             return Ok(());
                         }
-                        Err(_other_err) => {
-                            // TODO: some other TCP error, more handling necessary
+                        Err(other_err) => {
+                            tracing::warn!(
+                                "Error ({other_err:?}) on stream; closing session reader"
+                            );
+                            close_reader(&myself, state, "channel_closed");
+                            return Ok(());
                         }
                     }
                 }
@@ -478,6 +492,62 @@ impl Actor for SessionReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct SessionSink;
+
+    #[cfg_attr(feature = "async-trait", ractor::async_trait)]
+    impl Actor for SessionSink {
+        type Msg = SessionMessage;
+        type Arguments = ();
+        type State = ();
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            _args: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(())
+        }
+    }
+
+    struct FailingReader {
+        prefix: Vec<u8>,
+        offset: usize,
+        error_kind: io::ErrorKind,
+    }
+
+    impl FailingReader {
+        fn new(prefix: Vec<u8>, error_kind: io::ErrorKind) -> Self {
+            Self {
+                prefix,
+                offset: 0,
+                error_kind,
+            }
+        }
+    }
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.offset < self.prefix.len() {
+                let remaining = &self.prefix[self.offset..];
+                let len = remaining.len().min(buf.remaining());
+                buf.put_slice(&remaining[..len]);
+                self.offset += len;
+                return Poll::Ready(Ok(()));
+            }
+
+            Poll::Ready(Err(io::Error::new(self.error_kind, "injected read error")))
+        }
+    }
 
     #[test]
     fn test_encode_network_message_creates_valid_buffer() {
@@ -577,5 +647,59 @@ mod tests {
         }
 
         let _ = client_handle.await;
+    }
+
+    #[ractor::concurrency::test]
+    async fn session_reader_stops_on_length_read_error() {
+        let (session, session_handle) = Actor::spawn(None, SessionSink, ())
+            .await
+            .expect("failed to start session sink");
+        let (_, reader_handle) = Actor::spawn(
+            None,
+            SessionReader {
+                session: session.clone(),
+            },
+            ActorReadHalf::External(Box::new(FailingReader::new(
+                Vec::new(),
+                io::ErrorKind::ConnectionReset,
+            ))),
+        )
+        .await
+        .expect("failed to start session reader");
+
+        tokio::time::timeout(Duration::from_millis(500), reader_handle)
+            .await
+            .expect("session reader did not stop after length read error")
+            .expect("session reader task failed");
+
+        session.stop(None);
+        let _ = session_handle.await;
+    }
+
+    #[ractor::concurrency::test]
+    async fn session_reader_stops_on_payload_read_error() {
+        let (session, session_handle) = Actor::spawn(None, SessionSink, ())
+            .await
+            .expect("failed to start session sink");
+        let (_, reader_handle) = Actor::spawn(
+            None,
+            SessionReader {
+                session: session.clone(),
+            },
+            ActorReadHalf::External(Box::new(FailingReader::new(
+                8u64.to_be_bytes().to_vec(),
+                io::ErrorKind::NotConnected,
+            ))),
+        )
+        .await
+        .expect("failed to start session reader");
+
+        tokio::time::timeout(Duration::from_millis(500), reader_handle)
+            .await
+            .expect("session reader did not stop after payload read error")
+            .expect("session reader task failed");
+
+        session.stop(None);
+        let _ = session_handle.await;
     }
 }
